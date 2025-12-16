@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
+import { supabase } from "@/integrations/supabase/client";
 
 interface Message {
   id: string;
@@ -73,12 +74,14 @@ const Chat = () => {
       timestamp: new Date(),
     };
 
+    const updatedMessages = [...activeConversation.messages, userMessage];
+    
     setConversations((prev) =>
       prev.map((c) =>
         c.id === activeConversationId
           ? {
               ...c,
-              messages: [...c.messages, userMessage],
+              messages: updatedMessages,
               title:
                 c.messages.length === 0
                   ? inputValue.slice(0, 30) + "..."
@@ -91,33 +94,105 @@ const Chat = () => {
     setInputValue("");
     setIsTyping(true);
 
-    // Simulate AI response - will be replaced with actual AI
-    setTimeout(() => {
-      const aiResponse: Message = {
-        id: (Date.now() + 1).toString(),
-        role: "assistant",
-        content: generateLegalResponse(inputValue),
-        timestamp: new Date(),
-      };
+    try {
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/legal-chat`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+          },
+          body: JSON.stringify({
+            messages: updatedMessages.map((m) => ({
+              role: m.role,
+              content: m.content,
+            })),
+          }),
+        }
+      );
 
+      if (!response.ok) {
+        throw new Error("Failed to get response");
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No reader available");
+
+      const decoder = new TextDecoder();
+      let assistantContent = "";
+      const assistantMessageId = (Date.now() + 1).toString();
+
+      // Add initial assistant message
       setConversations((prev) =>
         prev.map((c) =>
           c.id === activeConversationId
-            ? { ...c, messages: [...c.messages, aiResponse] }
+            ? {
+                ...c,
+                messages: [
+                  ...c.messages,
+                  {
+                    id: assistantMessageId,
+                    role: "assistant" as const,
+                    content: "",
+                    timestamp: new Date(),
+                  },
+                ],
+              }
             : c
         )
       );
-      setIsTyping(false);
-    }, 1500);
-  };
 
-  const generateLegalResponse = (query: string): string => {
-    const responses = [
-      `Based on your query about "${query.slice(0, 50)}...", I can provide the following legal guidance:\n\nUnder Indian law, this matter typically falls under the jurisdiction of civil courts. The relevant provisions can be found in the Indian Contract Act, 1872 and the Code of Civil Procedure, 1908.\n\n**Key Points:**\n1. You have the right to seek legal remedy through proper channels\n2. Documentation is crucial for any legal proceedings\n3. Consultation with a qualified advocate is recommended for specific advice\n\nWould you like me to elaborate on any specific aspect?`,
-      `Regarding your question about "${query.slice(0, 50)}...", here's what Indian law says:\n\nThe Constitution of India, under Article 21, guarantees the right to life and personal liberty. This fundamental right has been interpreted broadly by the Supreme Court to include various aspects of dignified living.\n\n**Relevant Statutes:**\n- The Indian Penal Code, 1860\n- The Criminal Procedure Code, 1973\n- Specific state laws may also apply\n\nShall I provide more details on any particular statute?`,
-      `Thank you for your query about "${query.slice(0, 50)}..."\n\nThis is a matter that requires careful consideration of multiple legal provisions. In India, such cases are typically governed by:\n\n**Civil Law Framework:**\n- The Specific Relief Act, 1963\n- The Limitation Act, 1963\n- Relevant High Court rules\n\n**Important Note:** Legal matters can be complex, and outcomes depend on specific facts. I recommend documenting all relevant details and consulting with a licensed advocate.\n\nIs there a specific aspect you'd like me to focus on?`,
-    ];
-    return responses[Math.floor(Math.random() * responses.length)];
+      // Stream the response
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.slice(6).trim();
+            if (data === "[DONE]") continue;
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices?.[0]?.delta?.content;
+              if (content) {
+                assistantContent += content;
+                setConversations((prev) =>
+                  prev.map((c) =>
+                    c.id === activeConversationId
+                      ? {
+                          ...c,
+                          messages: c.messages.map((m) =>
+                            m.id === assistantMessageId
+                              ? { ...m, content: assistantContent }
+                              : m
+                          ),
+                        }
+                      : c
+                  )
+                );
+              }
+            } catch {
+              // Ignore parse errors for incomplete chunks
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Chat error:", error);
+      toast({
+        title: "Error",
+        description: "Failed to get a response. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsTyping(false);
+    }
   };
 
   const handleNewChat = () => {
